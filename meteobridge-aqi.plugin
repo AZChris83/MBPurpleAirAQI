@@ -1,0 +1,481 @@
+#!/bin/sh
+# Meteobridge AQI add-on
+# User-Defined Station plugin. Reads an existing PM2.5 sensor, calculates EPA
+# 2024 AQI/NowCast, and continuously emits Meteobridge plugin sensor records.
+# POSIX sh + awk; no Python dependency.
+
+set -u
+
+VERSION="1.0.3"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
+: "${SOURCE_STATION:=1}" "${PM25_SENSOR:=air1pm}" "${RH_SENSOR:=th0hum}"
+: "${MAX_SENSOR_AGE:=300}" "${MB_URL:=http://127.0.0.1}"
+: "${MB_USER:=}" "${MB_PASSWORD:=}" "${HTTP_TIMEOUT:=10}"
+: "${AQI_STANDARD:=EPA_2024}" "${AQI_MODE:=both}" "${AQI_CAP:=500}"
+: "${CATEGORY_SOURCE:=nowcast}" "${PURPLEAIR_CORRECTION:=none}"
+: "${CORRECTION_MISSING_RH:=reject}" "${NOWCAST_ENABLED:=yes}"
+: "${NOWCAST_HOURS:=12}" "${NOWCAST_MIN_RECENT:=2}"
+: "${NOWCAST_REQUIRE_CURRENT:=no}" "${MIN_HOURLY_COVERAGE:=75}"
+: "${OUTPUT_INSTANT_AQI:=data0}" "${OUTPUT_NOWCAST_AQI:=data1}"
+: "${OUTPUT_CATEGORY:=data2}" "${OUTPUT_PM25:=data3}"
+: "${OUTPUT_NOWCAST_PM25:=data4}" "${OUTPUT_STATUS:=data5}"
+: "${UPDATE_SECONDS:=60}"
+: "${LOG_LEVEL:=info}" "${STATE_DIR:=}"
+: "${LOG_MAX_KB:=256}"
+
+CONFIG_FOUND=no
+CONFIG_FILE=""
+if [ "${METEOBRIDGE_AQI_CONFIG+x}" = x ]; then
+    CONFIG_FILE=$METEOBRIDGE_AQI_CONFIG
+    [ -r "$CONFIG_FILE" ] && CONFIG_FOUND=yes
+else
+    for candidate in \
+        "$SCRIPT_DIR/meteobridge-aqi.conf" \
+        "/data/scripts/meteobridge-aqi.conf" \
+        "/scripts/meteobridge-aqi.conf"
+    do
+        if [ -r "$candidate" ]; then
+            CONFIG_FILE=$candidate
+            CONFIG_FOUND=yes
+            break
+        fi
+    done
+fi
+
+if [ "$CONFIG_FOUND" = yes ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+fi
+
+if [ -z "$STATE_DIR" ]; then
+    if [ "$CONFIG_FOUND" = yes ]; then
+        CONFIG_DIR=$(CDPATH= cd -- "$(dirname -- "$CONFIG_FILE")" 2>/dev/null && pwd)
+        STATE_DIR="$CONFIG_DIR/meteobridge-aqi-state"
+    else
+        STATE_DIR="${TMPDIR:-/tmp}/meteobridge-aqi-state"
+    fi
+fi
+
+HISTORY_FILE="$STATE_DIR/pm25-history.tsv"
+STATUS_FILE="$STATE_DIR/status.txt"
+OUTPUT_FILE="$STATE_DIR/last-output.txt"
+LOG_FILE="$STATE_DIR/meteobridge-aqi.log"
+LOCK_DIR="$STATE_DIR/.lock"
+
+usage() {
+    cat >&2 <<EOF
+Usage:
+  $0                     Run continuously as a Meteobridge User-Defined Plugin
+  $0 --once              Fetch once and emit one plugin update (diagnostic)
+  $0 --sample PM25 [RH]  Process a supplied sample (diagnostic/service integration)
+  $0 --show-source       Show resolved Meteobridge input sensors
+  $0 --status            Show the last human-readable status
+  $0 --reset-history     Remove retained NowCast samples
+  $0 --version           Show version
+EOF
+}
+
+is_uint() { case ${1-} in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
+is_number() {
+    awk -v v="${1-}" 'BEGIN { exit !(v ~ /^[-+]?[0-9]+([.][0-9]+)?$/) }'
+}
+
+validate_sensor() {
+    case $1 in
+        ''|*[!A-Za-z0-9\!]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+validate_output() {
+    case $1 in
+        data[0-9]|data[0-9][0-9]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+log_rank() {
+    case $1 in error) echo 0;; warn) echo 1;; info) echo 2;; debug) echo 3;; *) echo 2;; esac
+}
+
+rotate_log() {
+    [ -f "$LOG_FILE" ] || return 0
+    size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+    max=$((LOG_MAX_KB * 1024))
+    if [ "$size" -gt "$max" ]; then
+        mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || :
+    fi
+}
+
+log_msg() {
+    level=$1; shift
+    [ "$(log_rank "$level")" -le "$(log_rank "$LOG_LEVEL")" ] || return 0
+    rotate_log
+    printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date)" "$level" "$*" >> "$LOG_FILE" 2>/dev/null || :
+}
+
+fail_config() {
+    printf '%s 300\n' "${OUTPUT_STATUS:-data5}"
+    echo "meteobridge-aqi: configuration error: $*" >&2
+    exit 2
+}
+
+validate_config() {
+    is_uint "$SOURCE_STATION" || fail_config "SOURCE_STATION must be a non-negative integer"
+    validate_sensor "$PM25_SENSOR" || fail_config "invalid PM25_SENSOR"
+    validate_sensor "$RH_SENSOR" || fail_config "invalid RH_SENSOR"
+    for n in "$MAX_SENSOR_AGE" "$HTTP_TIMEOUT" "$AQI_CAP" "$NOWCAST_HOURS" \
+             "$NOWCAST_MIN_RECENT" "$MIN_HOURLY_COVERAGE" "$UPDATE_SECONDS" "$LOG_MAX_KB"; do
+        is_uint "$n" || fail_config "numeric settings must contain non-negative integers"
+    done
+    [ "$UPDATE_SECONDS" -gt 0 ] || fail_config "UPDATE_SECONDS must be greater than zero"
+    [ "$NOWCAST_HOURS" -ge 3 ] && [ "$NOWCAST_HOURS" -le 24 ] || fail_config "NOWCAST_HOURS must be 3 through 24"
+    [ "$NOWCAST_MIN_RECENT" -ge 1 ] && [ "$NOWCAST_MIN_RECENT" -le 3 ] || fail_config "NOWCAST_MIN_RECENT must be 1 through 3"
+    [ "$MIN_HOURLY_COVERAGE" -ge 1 ] && [ "$MIN_HOURLY_COVERAGE" -le 100 ] || fail_config "MIN_HOURLY_COVERAGE must be 1 through 100"
+    [ "$AQI_STANDARD" = "EPA_2024" ] || fail_config "only AQI_STANDARD=EPA_2024 is supported"
+    case $AQI_MODE in instant|nowcast|both) :;; *) fail_config "AQI_MODE must be instant, nowcast, or both";; esac
+    case $CATEGORY_SOURCE in instant|nowcast) :;; *) fail_config "CATEGORY_SOURCE must be instant or nowcast";; esac
+    case $PURPLEAIR_CORRECTION in none|epa_us) :;; *) fail_config "PURPLEAIR_CORRECTION must be none or epa_us";; esac
+    case $CORRECTION_MISSING_RH in reject|uncorrected) :;; *) fail_config "CORRECTION_MISSING_RH must be reject or uncorrected";; esac
+    case $NOWCAST_ENABLED in yes|no) :;; *) fail_config "NOWCAST_ENABLED must be yes or no";; esac
+    case $NOWCAST_REQUIRE_CURRENT in yes|no) :;; *) fail_config "NOWCAST_REQUIRE_CURRENT must be yes or no";; esac
+    for o in "$OUTPUT_INSTANT_AQI" "$OUTPUT_NOWCAST_AQI" "$OUTPUT_CATEGORY" "$OUTPUT_PM25" "$OUTPUT_NOWCAST_PM25" "$OUTPUT_STATUS"; do
+        validate_output "$o" || fail_config "invalid output sensor: $o"
+        output_number=${o#data}
+        [ "$output_number" -ge 0 ] && [ "$output_number" -le 99 ] || fail_config "output sensors must be data0 through data99"
+    done
+    outputs="$OUTPUT_INSTANT_AQI $OUTPUT_NOWCAST_AQI $OUTPUT_CATEGORY $OUTPUT_PM25 $OUTPUT_NOWCAST_PM25 $OUTPUT_STATUS"
+    [ "$(printf '%s\n' $outputs | sort -u | wc -l | tr -d ' ')" -eq 6 ] || fail_config "output sensors must be unique"
+}
+
+qualify_sensor() {
+    sensor=$1
+    case $sensor in
+        *!*) printf '%s\n' "$sensor" ;;
+        *)
+            printf '%s\n' "$sensor" | awk -v st="$SOURCE_STATION" '
+                $0 ~ /^[A-Za-z]+[0-9]+[A-Za-z]+$/ && match($0, /[0-9]+/) {
+                    print substr($0,1,RSTART-1) st "!" substr($0,RSTART,RLENGTH) substr($0,RSTART+RLENGTH)
+                    found=1
+                }
+                END { if (!found) exit 1 }
+            '
+            ;;
+    esac
+}
+
+urlencode_template() {
+    printf '%s' "$1" | sed \
+        -e 's/%/%25/g' -e 's/\[/%5B/g' -e 's/\]/%5D/g' \
+        -e 's/!/%21/g' -e 's/|/%7C/g' -e 's/:/%3A/g'
+}
+
+fetch_values() {
+    pm_sensor=$(qualify_sensor "$PM25_SENSOR") || return 1
+    rh_sensor=$(qualify_sensor "$RH_SENSOR") || return 1
+    template="[$pm_sensor-act:NA]|[$pm_sensor-age.0:999999]|[$rh_sensor-act:NA]|[$rh_sensor-age.0:999999]"
+    base=${MB_URL%/}
+
+    if command -v curl >/dev/null 2>&1; then
+        if [ -n "$MB_USER" ]; then
+            curl -fsS --max-time "$HTTP_TIMEOUT" -u "$MB_USER:$MB_PASSWORD" \
+                --get --data-urlencode "template=$template" \
+                "$base/cgi-bin/template.cgi"
+        else
+            curl -fsS --max-time "$HTTP_TIMEOUT" --get \
+                --data-urlencode "template=$template" \
+                "$base/cgi-bin/template.cgi"
+        fi
+        return $?
+    fi
+
+    encoded=$(urlencode_template "$template")
+    url="$base/cgi-bin/template.cgi?template=$encoded"
+    if command -v wget >/dev/null 2>&1; then
+        if [ -n "$MB_USER" ]; then
+            wget -q -T "$HTTP_TIMEOUT" --user="$MB_USER" --password="$MB_PASSWORD" -O - "$url"
+        else
+            wget -q -T "$HTTP_TIMEOUT" -O - "$url"
+        fi
+        return $?
+    fi
+
+    return 127
+}
+
+apply_correction() {
+    pm=$1; rh=$2
+    case $PURPLEAIR_CORRECTION in
+        none) awk -v p="$pm" 'BEGIN { if (p < 0) p=0; printf "%.4f\n", p }' ;;
+        epa_us)
+            awk -v p="$pm" -v h="$rh" 'BEGIN {
+                if (p <= 343) c=(0.524*p)-(0.0862*h)+5.75;
+                else c=(0.46*p)+(0.000393*p*p)+2.9738;
+                if (c < 0) c=0;
+                printf "%.4f\n", c
+            }'
+            ;;
+    esac
+}
+
+aqi_from_pm() {
+    awk -v raw="$1" -v cap="$AQI_CAP" 'BEGIN {
+        c=int((raw+0.0000001)*10)/10;
+        if      (c <= 9.0)   { cl=0.0;   ch=9.0;     il=0;   ih=50 }
+        else if (c <= 35.4)  { cl=9.1;   ch=35.4;    il=51;  ih=100 }
+        else if (c <= 55.4)  { cl=35.5;  ch=55.4;    il=101; ih=150 }
+        else if (c <= 125.4) { cl=55.5;  ch=125.4;   il=151; ih=200 }
+        else if (c <= 225.4) { cl=125.5; ch=225.4;   il=201; ih=300 }
+        else                 { cl=225.5; ch=325.4;   il=301; ih=500 }
+        a=((ih-il)/(ch-cl))*(c-cl)+il;
+        a=int(a+0.5);
+        if (a < 0) a=0;
+        if (a > cap) a=cap;
+        print a
+    }'
+}
+
+category_from_aqi() {
+    awk -v a="$1" 'BEGIN {
+        if (a <= 50) print 0;
+        else if (a <= 100) print 1;
+        else if (a <= 150) print 2;
+        else if (a <= 200) print 3;
+        else if (a <= 300) print 4;
+        else print 5;
+    }'
+}
+
+to_centi() {
+    awk -v v="$1" 'BEGIN { printf "%d\n", int((v*100)+0.5) }'
+}
+
+append_sample() {
+    now=$1; value=$2
+    last=0
+    if [ -s "$HISTORY_FILE" ]; then
+        last=$(tail -n 1 "$HISTORY_FILE" | awk '{print $1+0}')
+    fi
+    if [ $((now - last)) -ge "$UPDATE_SECONDS" ] || [ "$now" -lt "$last" ]; then
+        printf '%s\t%s\n' "$now" "$value" >> "$HISTORY_FILE"
+    fi
+
+    cutoff=$((now - ((NOWCAST_HOURS + 2) * 3600)))
+    awk -v c="$cutoff" -v n="$now" '$1 >= c && $1 <= n+60' "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv -f "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+}
+
+calculate_nowcast() {
+    now=$1
+    awk -v now="$now" -v hours="$NOWCAST_HOURS" -v interval="$UPDATE_SECONDS" \
+        -v coverage="$MIN_HOURLY_COVERAGE" -v minrecent="$NOWCAST_MIN_RECENT" \
+        -v requirecurrent="$NOWCAST_REQUIRE_CURRENT" '
+        function ceil(x) { return (x == int(x)) ? x : int(x)+1 }
+        {
+            hourstart=int(now/3600)*3600;
+            samplehour=int($1/3600)*3600;
+            age=int((hourstart-samplehour)/3600);
+            if (age >= 0 && age < hours) { sum[age]+=$2; count[age]++ }
+        }
+        END {
+            hourstart=int(now/3600)*3600;
+            elapsed=now-hourstart+1;
+            for (i=0; i<hours; i++) {
+                expected=(i==0) ? int(elapsed/interval)+1 : int(3600/interval);
+                if (expected < 1) expected=1;
+                needed=ceil(expected*coverage/100);
+                if (needed < 1) needed=1;
+                if (count[i] >= needed) {
+                    avg[i]=sum[i]/count[i]; valid[i]=1;
+                    if (!have || avg[i] < min) min=avg[i];
+                    if (!have || avg[i] > max) max=avg[i];
+                    have=1;
+                    if (i < 3) recent++;
+                }
+            }
+            if (!have || recent < minrecent || (requirecurrent=="yes" && !valid[0])) { print "NA"; exit }
+            w=(max>0) ? min/max : 1;
+            if (w < 0.5) w=0.5;
+            if (w > 1) w=1;
+            for (i=0; i<hours; i++) if (valid[i]) {
+                weight=w^i; numerator+=avg[i]*weight; denominator+=weight;
+            }
+            if (denominator <= 0) print "NA";
+            else printf "%.4f\n", numerator/denominator;
+        }
+    ' "$HISTORY_FILE"
+}
+
+write_status() {
+    state=$1; pm=${2:---}; instant=${3:---}; npm=${4:---}; naqi=${5:---}; catcode=${6:---}; detail=${7:-}
+    cat > "$STATUS_FILE.tmp" <<EOF
+Meteobridge AQI v$VERSION
+State: $state
+Updated: $(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date)
+PM2.5: $pm ug/m3
+Instant AQI: $instant
+NowCast PM2.5: $npm ug/m3
+NowCast AQI: $naqi
+Category code: $catcode
+Detail: $detail
+EOF
+    mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"
+}
+
+emit_line() {
+    sensor=$1; value=$2
+    printf '%s %s\n' "$sensor" "$(to_centi "$value")"
+}
+
+emit_status_only() {
+    code=$1
+    emit_line "$OUTPUT_STATUS" "$code" > "$OUTPUT_FILE.tmp"
+    mv -f "$OUTPUT_FILE.tmp" "$OUTPUT_FILE"
+    cat "$OUTPUT_FILE"
+}
+
+validate_config
+mkdir -p "$STATE_DIR" 2>/dev/null || {
+    printf '%s 300\n' "$OUTPUT_STATUS"
+    echo "meteobridge-aqi: cannot create STATE_DIR: $STATE_DIR" >&2
+    exit 1
+}
+
+case ${1-} in
+    '')
+        if [ "$CONFIG_FOUND" != yes ]; then
+            while :; do
+                emit_line "$OUTPUT_STATUS" 3
+                sleep "$UPDATE_SECONDS"
+            done
+        fi
+        self="$SCRIPT_DIR/${0##*/}"
+        # Meteobridge expects data immediately after starting the station.
+        # Status 1 means the source has not yet produced a verified sample.
+        emit_line "$OUTPUT_STATUS" 1
+        while :; do
+            METEOBRIDGE_AQI_CONFIG="$CONFIG_FILE" "$self" --once || :
+            sleep "$UPDATE_SECONDS"
+        done
+        ;;
+    --once)
+        if [ "$CONFIG_FOUND" != yes ]; then
+            emit_status_only 3
+            exit 0
+        fi
+        ;;
+    --help|-h) usage; exit 0 ;;
+    --version) echo "$VERSION"; exit 0 ;;
+    --show-source)
+        echo "PM2.5 sensor: $(qualify_sensor "$PM25_SENSOR")"
+        echo "RH sensor: $(qualify_sensor "$RH_SENSOR")"
+        exit 0
+        ;;
+    --status) [ -r "$STATUS_FILE" ] && cat "$STATUS_FILE" || echo "No status has been recorded yet."; exit 0 ;;
+    --reset-history) : > "$HISTORY_FILE"; rm -f "$OUTPUT_FILE"; echo "NowCast history cleared."; exit 0 ;;
+    --sample) : ;;
+    *) usage; exit 2 ;;
+esac
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    lock_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
+    if ! is_uint "$lock_pid" || ! kill -0 "$lock_pid" 2>/dev/null; then
+        rm -f "$LOCK_DIR/pid"
+        rmdir "$LOCK_DIR" 2>/dev/null || :
+        mkdir "$LOCK_DIR" 2>/dev/null || {
+            [ -r "$OUTPUT_FILE" ] && cat "$OUTPUT_FILE"
+            exit 0
+        }
+    else
+        [ -r "$OUTPUT_FILE" ] && cat "$OUTPUT_FILE"
+        exit 0
+    fi
+fi
+printf '%s\n' "$$" > "$LOCK_DIR/pid"
+trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null || :' EXIT HUP INT TERM
+
+now=${AQI_TEST_EPOCH:-$(date +%s)}
+sample_mode=no
+if [ "${1-}" = "--sample" ]; then
+    [ $# -ge 2 ] && [ $# -le 3 ] || { usage; exit 2; }
+    raw_pm=$2; pm_age=0; raw_rh=${3:-NA}; rh_age=0; sample_mode=yes
+else
+    response=$(fetch_values 2>/dev/null) || response=""
+    old_ifs=$IFS; IFS='|'; set -- $response; IFS=$old_ifs
+    raw_pm=${1:-NA}; pm_age=${2:-999999}; raw_rh=${3:-NA}; rh_age=${4:-999999}
+fi
+
+if ! is_number "$raw_pm" || ! is_uint "$pm_age" || [ "$pm_age" -gt "$MAX_SENSOR_AGE" ]; then
+    emit_status_only 1
+    write_status "NO DATA" "--" "--" "--" "--" "--" "PM2.5 missing, invalid, or older than ${MAX_SENSOR_AGE}s"
+    log_msg warn "PM2.5 input rejected (value=$raw_pm age=$pm_age)"
+    exit 0
+fi
+
+if awk -v p="$raw_pm" 'BEGIN { exit !(p < 0) }'; then
+    emit_status_only 1
+    write_status "NO DATA" "--" "--" "--" "--" "--" "negative PM2.5 input rejected"
+    log_msg warn "negative PM2.5 input rejected: $raw_pm"
+    exit 0
+fi
+
+if [ "$PURPLEAIR_CORRECTION" = "epa_us" ]; then
+    rh_ok=yes
+    is_number "$raw_rh" || rh_ok=no
+    is_uint "$rh_age" || rh_ok=no
+    [ "$rh_ok" = yes ] && [ "$rh_age" -le "$MAX_SENSOR_AGE" ] || rh_ok=no
+    if [ "$rh_ok" = no ]; then
+        if [ "$CORRECTION_MISSING_RH" = "reject" ]; then
+            emit_status_only 2
+            write_status "NO DATA" "--" "--" "--" "--" "--" "EPA correction enabled but RH is missing or stale"
+            log_msg warn "EPA correction requires valid RH; sample rejected"
+            exit 0
+        fi
+        corrected_pm=$raw_pm
+        log_msg warn "RH unavailable; using uncorrected PM2.5 by configuration"
+    else
+        corrected_pm=$(apply_correction "$raw_pm" "$raw_rh")
+    fi
+else
+    corrected_pm=$(apply_correction "$raw_pm" 0)
+fi
+
+instant_aqi=$(aqi_from_pm "$corrected_pm")
+append_sample "$now" "$corrected_pm"
+
+nowcast_pm=NA
+nowcast_aqi=NA
+if [ "$NOWCAST_ENABLED" = yes ] && [ "$AQI_MODE" != instant ]; then
+    nowcast_pm=$(calculate_nowcast "$now")
+    if [ "$nowcast_pm" != NA ]; then
+        nowcast_aqi=$(aqi_from_pm "$nowcast_pm")
+    fi
+fi
+
+category_aqi=NA
+if [ "$CATEGORY_SOURCE" = instant ]; then
+    category_aqi=$instant_aqi
+elif [ "$nowcast_aqi" != NA ]; then
+    category_aqi=$nowcast_aqi
+fi
+
+category_code=NA
+[ "$category_aqi" != NA ] && category_code=$(category_from_aqi "$category_aqi")
+
+{
+    if [ "$AQI_MODE" = instant ] || [ "$AQI_MODE" = both ]; then emit_line "$OUTPUT_INSTANT_AQI" "$instant_aqi"; fi
+    if [ "$AQI_MODE" = nowcast ] || [ "$AQI_MODE" = both ]; then
+        [ "$nowcast_aqi" != NA ] && emit_line "$OUTPUT_NOWCAST_AQI" "$nowcast_aqi"
+    fi
+    [ "$category_code" != NA ] && emit_line "$OUTPUT_CATEGORY" "$category_code"
+    emit_line "$OUTPUT_PM25" "$corrected_pm"
+    [ "$nowcast_pm" != NA ] && emit_line "$OUTPUT_NOWCAST_PM25" "$nowcast_pm"
+    emit_line "$OUTPUT_STATUS" 0
+} > "$OUTPUT_FILE.tmp"
+mv -f "$OUTPUT_FILE.tmp" "$OUTPUT_FILE"
+cat "$OUTPUT_FILE"
+
+detail="valid sample"
+[ "$nowcast_aqi" = NA ] && detail="valid sample; NowCast waiting for sufficient hourly coverage"
+write_status "OK" "$corrected_pm" "$instant_aqi" "$nowcast_pm" "$nowcast_aqi" "$category_code" "$detail"
+log_msg debug "pm=$corrected_pm instant_aqi=$instant_aqi nowcast_pm=$nowcast_pm nowcast_aqi=$nowcast_aqi category=$category_code sample_mode=$sample_mode"
+exit 0
