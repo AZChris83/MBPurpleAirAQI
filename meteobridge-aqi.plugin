@@ -6,7 +6,7 @@
 
 set -u
 
-VERSION="1.0.3"
+VERSION="1.0.4"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
 : "${SOURCE_STATION:=1}" "${PM25_SENSOR:=air1pm}" "${RH_SENSOR:=th0hum}"
 : "${MAX_SENSOR_AGE:=300}" "${MB_URL:=http://127.0.0.1}"
@@ -31,7 +31,7 @@ if [ "${METEOBRIDGE_AQI_CONFIG+x}" = x ]; then
 else
     for candidate in \
         "$SCRIPT_DIR/meteobridge-aqi.conf" \
-        "/data/scripts/meteobridge-aqi.conf" \
+        "/tmp/data/scripts/meteobridge-aqi.conf" \
         "/scripts/meteobridge-aqi.conf"
     do
         if [ -r "$candidate" ]; then
