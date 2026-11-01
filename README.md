@@ -1,406 +1,331 @@
 # Meteobridge AQI Plugin
 
-Version 1.0.3
+Version 2.0.0
+
+- [Version 2.0.0 release notes](RELEASE-NOTES-v2.0.0.md)
+- [Changelog](CHANGELOG.md)
+- [Ready-to-paste phpBB announcement](FORUM-POST-phpBB.txt)
 
 ## 1. Purpose
 
-Meteobridge AQI is a User-Defined Plugin that reads PM2.5 from an existing
-Meteobridge station and publishes current U.S. EPA air-quality values as new
+Meteobridge AQI is a User-Defined Station plugin that reads a PurpleAir sensor
+directly over the local network and publishes U.S. EPA air-quality values as
 Meteobridge sensors.
 
-The plugin provides:
+It provides instantaneous AQI-equivalent, EPA NowCast AQI, current and NowCast
+PM2.5, EPA category, health status, and optional EPA U.S.-wide PurpleAir
+correction.
 
-- Instantaneous PM2.5 AQI-equivalent
-- EPA particulate NowCast AQI
-- Corrected or uncorrected PM2.5 concentration
-- NowCast PM2.5 concentration
-- Numeric EPA air-quality category
-- Plugin health and error status
-- Optional EPA U.S.-wide PurpleAir correction
+Version 2.0.0 does not read another Meteobridge station and never calls
+Meteobridge `template.cgi`. This avoids re-entering the Meteobridge template
+engine from inside its logger-managed plugin process.
 
-PurpleAir is the primary use case, but any station that supplies a numeric
-PM2.5 sensor to Meteobridge can be used.
+### Why the plugin reads PurpleAir directly
 
-This is a normal Meteobridge plugin. No installer, service, cron job, package
-manager, or `/root/datafeed` modification is required.
+Version 1.x retrieved another Meteobridge station's values by calling
+`template.cgi` from inside the logger-managed plugin:
 
-## 2. Requirements
+```text
+Meteobridge logger
+  -> AQI plugin
+      -> template.cgi
+          -> Meteobridge logger/template evaluation
+```
+
+In the tested Meteobridge VM deployment, this circular access triggered a
+repeating `get_set`, `send_wnet_nosensor`, and `test_inetupload` call chain. The
+logger eventually terminated with signal 11, disconnected every station, and
+sometimes failed to restore the Meteostick serial session.
+
+Version 2.0.0 removes that re-entry:
+
+```text
+PurpleAir /json -> AQI plugin -> Meteobridge logger
+```
+
+The PurpleAir request is local, is made once every two minutes, and is only a
+few kilobytes. The new path completed the previous 24-hour failure window
+without a logger segmentation fault or Meteostick interruption. Longer-term
+observation is still recommended on each installation.
+
+No installer, cron job, service, Python runtime, or modification outside the
+Meteobridge scripts directory is required.
+
+## 2. Requirements and platforms
 
 - Meteobridge firmware with User-Defined Plugin station support
-- An existing Meteobridge station that reports PM2.5
+- A PurpleAir sensor reachable from Meteobridge over the LAN
+- A reserved or static address for the PurpleAir sensor
 - Access to the Meteobridge `scripts` directory
-- The local Meteobridge `template.cgi` endpoint
-- `curl` or `wget`, normally already included with Meteobridge
-- A writable location for history, status, and log files
+- `curl` or `wget`, normally included with Meteobridge
+- Writable local storage for NowCast history, status, and logs
 
-The plugin uses POSIX shell and `awk`. Python is not required.
+The plugin uses POSIX shell and `awk`.
 
-### 2.1 Supported Meteobridge platforms
-
-This release requires a Meteobridge platform with a local `scripts` directory.
-It uses two local files and retains NowCast history, status, and logs in writable
-local storage.
-
-Supported platforms are:
-
-- Meteobridge PRO, including the original red and black models
-- Meteobridge PRO2
-- Meteobridge NANO SD
-- Meteobridge Raspberry Pi
-- Meteobridge VM
-
-This package does not support:
-
-- Original TP-Link, D-Link, or other router hardware flashed with Meteobridge
-- Meteobridge NANO without the SD storage option
-
-Some of those platforms can download a User-Defined Plugin from a URL, but this
-package is intentionally not a single-file URL plugin. It requires the separate
-`meteobridge-aqi.conf` file and writable storage for its operating state. No
-URL-only edition is provided.
-
-If the Meteobridge interface does not provide a local `scripts` directory, this
-AQI plugin should be considered unsupported on that platform.
+Supported platforms with local scripts and persistent storage are Meteobridge
+PRO, PRO2, NANO SD, Raspberry Pi, and VM. This package is not intended for the
+original flashed router platforms or NANO without SD storage. It is a two-file
+local plugin, not a single-file URL plugin.
 
 ## 3. Package contents
 
-| File | Purpose | Required on Meteobridge |
+| File | Purpose | Required |
 | --- | --- | --- |
-| `meteobridge-aqi.plugin` | Executable User-Defined Plugin | Yes |
-| `meteobridge-aqi.conf` | Plugin configuration | Yes |
-| `aqi-status.template` | Optional human-readable display template | No |
+| `meteobridge-aqi.plugin` | Executable User-Defined Station plugin | Yes |
+| `meteobridge-aqi.conf` | Configuration | Yes |
+| `aqi-status.template` | Optional display template | No |
 | `README.md` | Complete documentation | No |
+| `RELEASE-NOTES-v2.0.0.md` | Release and migration notes | No |
+| `CHANGELOG.md` | Version history | No |
+| `FORUM-POST-phpBB.txt` | Ready-to-paste forum announcement | No |
 | `LICENSE` | MIT license | No |
-| `tests/run-tests.sh` | Calculation and protocol tests for Linux | No |
+| `tests/run-tests.sh` | Linux validation suite | No |
 
 ## 4. Installation
 
-### 4.1 Extract the package
+### 4.1 Reserve and test the PurpleAir address
 
-Extract the ZIP archive on a computer. The two files that must be copied to
-Meteobridge are:
+Create a DHCP reservation so the sensor address does not change. This
+installation uses `10.24.170.191`.
+
+The included address is specific to the original installation. Anyone using
+this project from GitHub must replace it with the reserved LAN address of their
+own PurpleAir sensor.
+
+Test it from Meteobridge:
+
+```sh
+wget -qO- http://10.24.170.191/json
+```
+
+The JSON must contain `pm2_5_atm`, `pm2_5_atm_b`, `current_humidity`, and
+`uptime`.
+
+### 4.2 Copy the files
+
+Copy these files into `/temp/data/scripts`:
 
 ```text
 meteobridge-aqi.plugin
 meteobridge-aqi.conf
 ```
 
-### 4.2 Copy the files
+The plugin also recognizes `/tmp/data/scripts`, `/tmp/mnt/data/scripts`,
+`/data/scripts`, and `/scripts` for platform variants.
 
-Copy both files into the Meteobridge `scripts` directory. Depending on the
-platform, this may be the `scripts` folder on the exposed Meteobridge data
-share, `/data/scripts`, or another path shown by that Meteobridge system.
-
-Do not enter an Internet URL for this release. The `.plugin` and `.conf` files
-must both be stored locally on the Meteobridge platform.
-
-Keep the `.plugin` and `.conf` files together and do not rename either file.
-
-If shell access and Unix permissions are exposed, make the plugin executable:
+Keep both filenames unchanged. If permissions are exposed:
 
 ```sh
-chmod 755 /data/scripts/meteobridge-aqi.plugin
+chmod 755 /temp/data/scripts/meteobridge-aqi.plugin
+chmod 644 /temp/data/scripts/meteobridge-aqi.conf
 ```
 
-The configuration file does not need executable permission.
+### 4.3 Configure the source
 
-### 4.3 Add the User-Defined Plugin station
-
-1. Open the Meteobridge web interface.
-2. Open the **Weather Station** configuration page.
-3. Add an additional station.
-4. Select **User-Defined Plugin** as its station type.
-5. Select `meteobridge-aqi.plugin` from the plugin list.
-6. Save the configuration.
-7. Restart the station process if Meteobridge requests it.
-
-Meteobridge starts the script and keeps it running. The plugin emits a status
-record immediately, then queries the configured source every 60 seconds by
-default.
-
-If the file is not shown in the plugin list, confirm that:
-
-- Its filename ends with `.plugin`.
-- It has Unix line endings.
-- It is in the correct `scripts` directory.
-- It is readable and executable by Meteobridge.
-
-## 5. Configure the source sensor
-
-Edit `meteobridge-aqi.conf` before or after copying it to Meteobridge.
-
-### 5.1 Meteobridge sensor names
-
-Meteobridge uses station-qualified sensor names such as `air1!1pm`:
-
-- `air` identifies an air-quality sensor family.
-- The first `1` identifies Meteobridge Station 1.
-- `!1pm` identifies PM channel 1.
-
-For the mapping observed on Meteobridge:
-
-| Physical sensor | Generic sensor | Meaning |
-| --- | --- | --- |
-| `air1!0pm` | `air0pm` | PM10 or default particulate channel |
-| `air1!1pm` | `air1pm` | PM2.5 |
-| `air1!2pm` | `air2pm` | PM1 |
-
-The AQI plugin must use the PM2.5 channel, not PM10. For a PurpleAir source on
-Station 1, use:
+The included configuration contains:
 
 ```sh
-SOURCE_STATION=1
-PM25_SENSOR="air1pm"
-RH_SENSOR="th0hum"
+PURPLEAIR_URL="http://10.24.170.191/json"
+PM25_SOURCE="atm"
+UPDATE_SECONDS=120
 ```
 
-The plugin converts those generic names to:
+Change only `PURPLEAIR_URL` if the reservation changes. Keep `/json`; it
+provides the sensor's two-minute average.
+
+### 4.4 Add the station
+
+1. Open Meteobridge Weather Station configuration.
+2. Add an additional station.
+3. Select User-Defined Plugin.
+4. Select `meteobridge-aqi.plugin`.
+5. Save and press Reload Plugin, or restart the station process if requested.
+
+The plugin first emits status 1. The first valid PurpleAir response changes it
+to 0 and publishes PM2.5/AQI values.
+
+## 5. PurpleAir input
+
+### 5.1 Channel averaging
+
+For outdoor ATM data, the plugin reads channel A `pm2_5_atm` and channel B
+`pm2_5_atm_b`. It averages them when both are valid. The verified sample gives:
 
 ```text
-PM2.5:    air1!1pm
-Humidity: th1!0hum
+Channel A: 2.97 ug/m3
+Channel B: 3.36 ug/m3
+Average:   3.165 ug/m3
 ```
 
-The humidity name must be verified under Meteobridge Live Data because station
-drivers can map it differently.
+If one channel is unavailable, the plugin uses the other and records the
+fallback in `status.txt`. If both are invalid, it emits status 1 instead of a
+false zero.
 
-### 5.2 Fully qualified names
+### 5.2 ATM versus CF=1
 
-A full physical sensor name can be used to bypass automatic qualification:
+The default `PM25_SOURCE="atm"` is appropriate for this outdoor installation.
+Setting `PM25_SOURCE="cf1"` reads `pm2_5_cf_1` and `pm2_5_cf_1_b` instead.
 
-```sh
-PM25_SENSOR="air1!1pm"
-RH_SENSOR="th1!0hum"
-```
+Use CF=1 only when intentionally applying the plugin's EPA correction. Do not
+apply that correction to ATM data.
 
-When a sensor contains `!`, `SOURCE_STATION` is not inserted into that sensor
-name.
+### 5.3 Frozen-response protection
 
-### 5.3 Source station versus plugin station
+The plugin tracks PurpleAir `uptime`. If it does not advance for longer than
+`MAX_SENSOR_AGE`, the data is considered frozen and status 1 is emitted. A
+lower uptime is accepted as a sensor reboot. The default maximum is 300 seconds.
 
-`SOURCE_STATION` is the station supplying PM2.5. It is not the station where
-the AQI plugin is installed.
+## 6. Configuration reference
 
-For example:
-
-```text
-Station 1: PurpleAir source
-Station 4: Meteobridge AQI plugin
-```
-
-The correct setting remains:
-
-```sh
-SOURCE_STATION=1
-```
-
-Setting it to 4 would make the plugin query itself instead of PurpleAir.
-
-### 5.4 Stale-data protection
-
-```sh
-MAX_SENSOR_AGE=300
-```
-
-This rejects PM2.5 data older than 300 seconds. Rejected or missing data is not
-reported as zero, because zero is a valid clean-air measurement.
-
-## 6. Complete configuration reference
-
-### 6.1 Input and local connection
+### 6.1 Connection
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `SOURCE_STATION` | `1` | Meteobridge station number containing the source sensor |
-| `PM25_SENSOR` | `air1pm` | Generic or fully qualified PM2.5 sensor |
-| `RH_SENSOR` | `th0hum` | Generic or fully qualified relative-humidity sensor |
-| `MAX_SENSOR_AGE` | `300` | Maximum accepted sensor age in seconds |
-| `MB_URL` | `http://127.0.0.1` | Local Meteobridge web endpoint |
-| `MB_USER` | blank | Optional HTTP username |
-| `MB_PASSWORD` | blank | Optional HTTP password |
-| `HTTP_TIMEOUT` | `10` | Maximum HTTP query time in seconds |
+| `PURPLEAIR_URL` | `http://10.24.170.191/json` | Complete local JSON URL |
+| `PM25_SOURCE` | `atm` | `atm` or `cf1`; A and B are averaged |
+| `MAX_SENSOR_AGE` | `300` | Accepted unchanged uptime in seconds |
+| `HTTP_TIMEOUT` | `10` | HTTP request timeout in seconds |
 
-Local access normally does not require credentials. If credentials are
-required, remember that the password is stored as plain text in the
-configuration file and protect its permissions accordingly.
+There are no Meteobridge credentials, source station numbers, sensor names, or
+`template.cgi` settings in version 2.0.0.
 
 ### 6.2 AQI calculation
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `AQI_STANDARD` | `EPA_2024` | AQI breakpoint set; this is the only supported value |
+| `AQI_STANDARD` | `EPA_2024` | Only supported breakpoint set |
 | `AQI_MODE` | `both` | `instant`, `nowcast`, or `both` |
-| `AQI_CAP` | `500` | Maximum published AQI; `999` permits extended Hazardous values |
-| `CATEGORY_SOURCE` | `nowcast` | Use `instant` or `nowcast` AQI for the category output |
+| `AQI_CAP` | `500` | Maximum AQI; `999` permits extended values |
+| `CATEGORY_SOURCE` | `nowcast` | `instant` or `nowcast` |
 
-Instant AQI is an immediate AQI-equivalent calculated directly from the latest
-PM2.5 value. It is useful for rapid changes but is not the official EPA
-24-hour AQI.
+Instant AQI is calculated from the latest PM2.5 sample but is not the official
+EPA 24-hour AQI. NowCast uses weighted hourly concentrations and is preferred
+once enough history is available.
 
-NowCast is the preferred current-health indicator because it uses weighted
-hourly concentrations and responds more quickly during changing conditions
-than a plain long-term average.
-
-### 6.3 Optional PurpleAir correction
+### 6.3 Optional correction
 
 | Setting | Default | Description |
 | --- | --- | --- |
 | `PURPLEAIR_CORRECTION` | `none` | `none` or `epa_us` |
 | `CORRECTION_MISSING_RH` | `reject` | `reject` or `uncorrected` |
 
-Leave correction disabled unless the selected field is raw PurpleAir PM2.5
-CF=1 data:
+For ATM input:
 
 ```sh
+PM25_SOURCE="atm"
 PURPLEAIR_CORRECTION="none"
 ```
 
-To apply the EPA U.S.-wide PurpleAir correction:
+For EPA correction of raw CF=1 values:
 
 ```sh
+PM25_SOURCE="cf1"
 PURPLEAIR_CORRECTION="epa_us"
 ```
 
-For concentrations through 343 micrograms per cubic meter:
+The correction uses PurpleAir `current_humidity`. Through 343 ug/m3:
 
 ```text
-corrected PM2.5 = 0.524 × CF1 - 0.0862 × RH + 5.75
+corrected PM2.5 = 0.524 x CF1 - 0.0862 x RH + 5.75
 ```
 
-Above 343 micrograms per cubic meter:
+Above 343 ug/m3:
 
 ```text
-corrected PM2.5 = 0.46 × CF1 + 0.000393 × CF1² + 2.9738
+corrected PM2.5 = 0.46 x CF1 + 0.000393 x CF1^2 + 2.9738
 ```
 
-Do not enable this merely because the device is a PurpleAir. If PurpleAir or
-Meteobridge already corrected the selected value, enabling it here applies a
-second correction and produces an incorrect result.
-
-With `CORRECTION_MISSING_RH="reject"`, missing or stale humidity prevents the
-sample from being processed. With `uncorrected`, the raw PM2.5 value is used
-when humidity is unavailable.
-
-### 6.4 NowCast settings
+### 6.4 NowCast
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `NOWCAST_ENABLED` | `yes` | Enables NowCast history and calculation |
-| `NOWCAST_HOURS` | `12` | Maximum number of hourly averages, 3 through 24 |
-| `NOWCAST_MIN_RECENT` | `2` | Required usable hours among the newest three hours |
-| `NOWCAST_REQUIRE_CURRENT` | `no` | Whether the current clock hour must be usable |
-| `MIN_HOURLY_COVERAGE` | `75` | Percentage of expected samples needed for an hour |
+| `NOWCAST_ENABLED` | `yes` | Enable history and NowCast |
+| `NOWCAST_HOURS` | `12` | Hourly averages, 3 through 24 |
+| `NOWCAST_MIN_RECENT` | `2` | Usable hours among newest three |
+| `NOWCAST_REQUIRE_CURRENT` | `no` | Require current clock hour |
+| `MIN_HOURLY_COVERAGE` | `75` | Required sample coverage percentage |
 
-The first NowCast is not immediate. With the defaults, the plugin needs at
-least two usable hours among the latest three and adequate sample coverage.
-Depending on the time the plugin starts, the first NowCast normally appears
-after approximately one to two hours.
+NowCast normally appears after one to two hours. Before then, its outputs are
+absent rather than reported as zero.
 
-Until then, NowCast outputs are intentionally absent. They are not reported as
-zero.
-
-### 6.5 Output sensor assignments
+### 6.5 Outputs
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `OUTPUT_INSTANT_AQI` | `data0` | Instantaneous AQI-equivalent |
-| `OUTPUT_NOWCAST_AQI` | `data1` | EPA particulate NowCast AQI |
+| `OUTPUT_NOWCAST_AQI` | `data1` | EPA NowCast AQI |
 | `OUTPUT_CATEGORY` | `data2` | EPA category code |
-| `OUTPUT_PM25` | `data3` | Current PM2.5 after optional correction |
-| `OUTPUT_NOWCAST_PM25` | `data4` | NowCast PM2.5 concentration |
-| `OUTPUT_STATUS` | `data5` | Plugin status code |
-
-Output assignments must be unique and must use `data0` through `data99`.
+| `OUTPUT_PM25` | `data3` | Current PM2.5 |
+| `OUTPUT_NOWCAST_PM25` | `data4` | NowCast PM2.5 |
+| `OUTPUT_STATUS` | `data5` | Plugin status |
 
 ### 6.6 Operation and storage
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `UPDATE_SECONDS` | `60` | Time between source queries |
+| `UPDATE_SECONDS` | `120` | Time between PurpleAir requests |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` |
 | `STATE_DIR` | blank | Optional explicit state directory |
-| `LOG_MAX_KB` | `256` | Log rotation threshold in kilobytes |
+| `LOG_MAX_KB` | `256` | Log rotation threshold in KB |
 
-When `STATE_DIR` is blank, state is stored in a
-`meteobridge-aqi-state` directory beside the configuration file. The directory
-contains:
+Blank `STATE_DIR` creates `meteobridge-aqi-state` beside the configuration:
 
 | File | Purpose |
 | --- | --- |
-| `pm25-history.tsv` | Timestamped samples used for NowCast |
-| `status.txt` | Last human-readable plugin status |
-| `last-output.txt` | Most recent emitted plugin records |
-| `meteobridge-aqi.log` | Operational log |
+| `pm25-history.tsv` | NowCast samples |
+| `source-stamp.txt` | Last PurpleAir uptime/change time |
+| `status.txt` | Human-readable status |
+| `last-output.txt` | Most recent plugin records |
+| `meteobridge-aqi.log` | Rotating operational log |
 
-The log rotates to `meteobridge-aqi.log.1` when it exceeds `LOG_MAX_KB`.
+## 7. Results
 
-## 7. Output sensors and results
+For plugin Station 4, the outputs are:
 
-The output sensors belong to the User-Defined Plugin station. If the plugin is
-Station 4, the default physical sensor names are:
-
-| Meteobridge display | Physical sensor | Meaning |
+| Display | Physical sensor | Meaning |
 | --- | --- | --- |
 | Data | `data4!0num` | Instantaneous AQI-equivalent |
 | Data #1 | `data4!1num` | EPA NowCast AQI |
 | Data #2 | `data4!2num` | EPA category code |
-| Data #3 | `data4!3num` | Current PM2.5 in micrograms per cubic meter |
-| Data #4 | `data4!4num` | NowCast PM2.5 in micrograms per cubic meter |
-| Data #5 | `data4!5num` | Plugin status code |
+| Data #3 | `data4!3num` | Current PM2.5 in ug/m3 |
+| Data #4 | `data4!4num` | NowCast PM2.5 in ug/m3 |
+| Data #5 | `data4!5num` | Plugin status |
 
-For a different plugin station, replace the station number before `!`. For
-example, Station 2 uses `data2!0num` through `data2!5num`.
-
-### 7.1 Example results
-
-The following Station 4 results indicate normal operation:
+The verified sample should initially produce approximately:
 
 | Display | Value | Interpretation |
 | --- | ---: | --- |
-| Data #5 | `0.00` | Plugin is healthy |
-| Data | `17.00` | Instantaneous AQI-equivalent is 17 |
-| Data #3 | `3.00` | Current PM2.5 is 3.0 micrograms per cubic meter |
+| Data #5 | `0.00` | Healthy |
+| Data | `17.00` | Instantaneous AQI-equivalent 17 |
+| Data #3 | `3.17` | A/B averaged PM2.5 |
 
-An AQI of 17 is in the Good category.
+### 7.1 Category codes
 
-If Data #1, Data #2, and Data #4 are initially absent, this is normally because
-NowCast does not yet have enough history. Data #2 also waits when
-`CATEGORY_SOURCE="nowcast"`. To publish the category immediately from instant
-AQI, use:
+| Code | Category |
+| ---: | --- |
+| 0 | Good |
+| 1 | Moderate |
+| 2 | Unhealthy for Sensitive Groups |
+| 3 | Unhealthy |
+| 4 | Very Unhealthy |
+| 5 | Hazardous |
 
-```sh
-CATEGORY_SOURCE="instant"
-```
+### 7.2 Status codes
 
-### 7.2 Category codes
-
-| Code | EPA category | Typical color |
+| Code | Meaning | Action |
 | ---: | --- | --- |
-| 0 | Good | Green |
-| 1 | Moderate | Yellow |
-| 2 | Unhealthy for Sensitive Groups | Orange |
-| 3 | Unhealthy | Red |
-| 4 | Very Unhealthy | Purple |
-| 5 | Hazardous | Maroon |
+| 0 | Healthy | None |
+| 1 | PurpleAir missing, invalid, frozen, or unreachable | Check address, VLAN access, power, and JSON |
+| 2 | Humidity unavailable for EPA correction | Restore humidity, disable correction, or allow fallback |
+| 3 | Configuration/state error | Check settings, paths, and permissions |
 
-### 7.3 Status codes
+The plugin retries indefinitely. A valid response automatically restores 0.
 
-| Code | Meaning | Recommended action |
-| ---: | --- | --- |
-| 0 | Healthy | No action required |
-| 1 | PM2.5 source missing, invalid, stale, or unreachable | Verify source station, PM2.5 name, age, and local endpoint |
-| 2 | Humidity unavailable while EPA correction requires it | Verify `RH_SENSOR`, disable correction, or allow uncorrected fallback |
-| 3 | Configuration missing, invalid, or state directory unusable | Check filenames, paths, settings, and permissions |
+## 8. EPA 2024 breakpoints
 
-The startup heartbeat initially reports status 1 until the first source query
-is validated. It should normally change to 0 within one update interval.
+PM2.5 is truncated to one decimal before interpolation and AQI is rounded.
 
-## 8. EPA 2024 PM2.5 breakpoints
-
-PM2.5 is truncated to one decimal place before interpolation. AQI is rounded to
-the nearest whole number.
-
-| PM2.5, micrograms per cubic meter | AQI | Category |
+| PM2.5, ug/m3 | AQI | Category |
 | ---: | ---: | --- |
 | 0.0 to 9.0 | 0 to 50 | Good |
 | 9.1 to 35.4 | 51 to 100 | Moderate |
@@ -409,192 +334,89 @@ the nearest whole number.
 | 125.5 to 225.4 | 201 to 300 | Very Unhealthy |
 | 225.5 to 325.4 | 301 to 500 | Hazardous |
 
-AQI is capped at 500 by default. Setting `AQI_CAP=999` permits extended
-Hazardous values using the same slope as the AQI 301 through 500 segment.
+## 9. Diagnostics
 
-## 9. Optional display template
-
-`aqi-status.template` provides a human-readable Meteobridge template example.
-It assumes the AQI plugin is Station 2. If the plugin is Station 4, replace
-every `data2!` prefix with `data4!` before using it.
-
-The template shows current PM2.5, instant AQI, NowCast values, plugin status,
-and the named EPA category.
-
-## 10. Command-line diagnostics
-
-These commands are optional and require shell access. Run them from the
-directory containing the plugin and configuration.
-
-Show the plugin version:
+Run from `/temp/data/scripts`:
 
 ```sh
 ./meteobridge-aqi.plugin --version
-```
-
-Show the resolved source sensor names:
-
-```sh
 ./meteobridge-aqi.plugin --show-source
-```
-
-For the standard Station 1 PurpleAir configuration, the result should include:
-
-```text
-PM2.5 sensor: air1!1pm
-RH sensor: th1!0hum
-```
-
-Fetch and process one live update:
-
-```sh
 ./meteobridge-aqi.plugin --once
-```
-
-Display the last human-readable status:
-
-```sh
 ./meteobridge-aqi.plugin --status
-```
-
-Test a supplied PM2.5 value of 48.7 and humidity of 42 percent:
-
-```sh
 ./meteobridge-aqi.plugin --sample 48.7 42
 ```
 
-Clear retained NowCast history:
+`--show-source` should display:
 
-```sh
-./meteobridge-aqi.plugin --reset-history
+```text
+PurpleAir URL: http://10.24.170.191/json
+PM2.5 source: atm (channel A/B average)
 ```
 
-## 11. Troubleshooting
+## 10. Troubleshooting
 
-### 11.1 Status remains 1
+### 10.1 Status remains 1
 
-Check these items in order:
+Run `wget -qO- http://10.24.170.191/json`, then verify:
 
-1. Verify the source PM2.5 value under Meteobridge Live Data.
-2. Confirm that the source is PM2.5, normally `air1!1pm`, not PM10 at
-   `air1!0pm`.
-3. Verify that `SOURCE_STATION` identifies the PurpleAir station rather than
-   the AQI plugin station.
-4. Run `--show-source` and compare the result with Live Data.
-5. Confirm that the source age is below `MAX_SENSOR_AGE`.
-6. Confirm that `http://127.0.0.1/cgi-bin/template.cgi` is available locally.
-7. Check `meteobridge-aqi-state/status.txt` and `meteobridge-aqi.log`.
+1. The reservation is still `10.24.170.191`.
+2. Meteobridge can reach TCP port 80 across the VLANs.
+3. JSON contains both ATM PM2.5 fields and `uptime`.
+4. `uptime` increases between requests.
+5. `status.txt` and `meteobridge-aqi.log` show no new error.
 
-### 11.2 Meteobridge reports `unexpected 0 bytes`
+### 10.2 Status 2 or 3
 
-Version 1.0.1 and later emit a status heartbeat immediately. If a current
-version still produces zero bytes, check that:
+Status 2 applies only to EPA correction and missing humidity. Status 3 means
+the configuration is missing/invalid or the state directory is unusable. The
+plugin searches beside itself and in the scripts directories from section 4.2.
 
-- The selected plugin is the current `meteobridge-aqi.plugin` file.
-- The file is executable and uses Unix line endings.
-- Meteobridge is not running an older cached copy.
-- The station process was restarted after replacement.
+### 10.3 NowCast is absent
 
-### 11.3 Status is 2
+Wait one to two hours. If it remains absent, inspect history for gaps and check
+`MIN_HOURLY_COVERAGE`.
 
-EPA PurpleAir correction is enabled, but humidity is missing, invalid, or
-stale. Verify `RH_SENSOR`, or choose one of these configurations:
+### 10.4 Logger stability
 
-```sh
-PURPLEAIR_CORRECTION="none"
-```
+Version 2.0.0 contains no request to `127.0.0.1`, `template.cgi`, Meteobridge
+live-data ports, or Meteobridge databases. Its only input request is the
+configured PurpleAir URL. If logger crashes continue, disable the plugin and
+investigate another logger service.
 
-or:
+## 11. Upgrading from version 1.x
 
-```sh
-CORRECTION_MISSING_RH="uncorrected"
-```
+Version 2.0.0 changes the input architecture. Do not reuse the complete 1.x
+configuration unchanged.
 
-The second option permits output without applying the correction when humidity
-is unavailable.
+1. Stop the old AQI plugin station.
+2. Replace the plugin file.
+3. Replace or update the configuration.
+4. Remove `SOURCE_STATION`, `PM25_SENSOR`, `RH_SENSOR`, `MB_URL`, `MB_USER`, and
+   `MB_PASSWORD`.
+5. Set `PURPLEAIR_URL` to the local `/json` endpoint.
+6. Reload the plugin station and confirm Data #5 becomes 0.
 
-### 11.4 Status is 3
+Existing NowCast history can be retained because the physical sensor is the
+same. Clear it for a clean old-input versus direct-input comparison.
 
-Verify that the configuration is named exactly `meteobridge-aqi.conf`. The
-plugin searches:
+## 12. Limitations
 
-1. Beside the running plugin
-2. `/data/scripts/meteobridge-aqi.conf`
-3. `/scripts/meteobridge-aqi.conf`
+- This is not a regulatory monitor.
+- Instant AQI is not official EPA 24-hour AQI.
+- Local JSON does not include PurpleAir server-side channel flags.
+- Agreement with AirNow is not guaranteed.
+- Missed samples are not backfilled.
+- Do not replace emergency or medical instructions with plugin output.
 
-Also check for invalid configuration values, duplicate output assignments, and
-an unwritable `STATE_DIR`.
+Run the Linux validation suite with `./tests/run-tests.sh`.
 
-### 11.5 Instant results appear but NowCast does not
+## 13. References
 
-This is normal immediately after installation. With default settings, NowCast
-needs at least two sufficiently complete recent hourly averages. Wait up to
-approximately two hours before treating it as a fault.
+- [PurpleAir local JSON documentation](https://community.purpleair.com/t/sensor-json-documentation/6917)
+- [PurpleAir data access methods](https://community.purpleair.com/t/how-to-obtain-sensor-data/9727)
+- [EPA AQI breakpoints](https://aqs.epa.gov/aqsweb/documents/codetables/aqi_breakpoints.html)
+- [EPA AQI technical assistance](https://www.airnow.gov/publications/air-quality-index/technical-assistance-document-for-reporting-the-daily-aqi/)
 
-If it still does not appear, inspect the source for gaps and consider whether
-`MIN_HOURLY_COVERAGE=75` is appropriate for the update interval and source
-reliability.
-
-### 11.6 Values look too low after enabling correction
-
-The most likely cause is double correction. Disable the plugin correction and
-compare values:
-
-```sh
-PURPLEAIR_CORRECTION="none"
-```
-
-Only raw PurpleAir CF=1 data should receive the plugin's `epa_us` correction.
-
-## 12. Updating the plugin
-
-1. Save a backup copy of `meteobridge-aqi.conf`.
-2. Replace `meteobridge-aqi.plugin` with the new version.
-3. Compare the included configuration with the existing file for new options.
-4. Preserve site-specific source names and credentials.
-5. Restart or resave the User-Defined Plugin station.
-6. Verify that Data #5 changes to 0 and Data #3 contains current PM2.5.
-
-When upgrading from a package that used `PM25_SENSOR="air0pm"`, change it to
-`PM25_SENSOR="air1pm"` or the fully qualified `air1!1pm` for PM2.5.
-
-Existing NowCast history can normally be retained. Clear it only when changing
-to a different physical PM2.5 source or when the stored history is known to be
-invalid.
-
-## 13. Removal
-
-1. Remove or disable the User-Defined Plugin station in Meteobridge.
-2. Delete `meteobridge-aqi.plugin` and `meteobridge-aqi.conf` from the scripts
-   directory.
-3. If historical data and logs are no longer needed, delete the
-   `meteobridge-aqi-state` directory.
-
-Removing the plugin does not modify the original PM2.5 station.
-
-## 14. Validation and limitations
-
-- This plugin is not a regulatory monitor.
-- Instant AQI is not the official EPA 24-hour AQI.
-- Agreement with AirNow is not guaranteed because sensor hardware, siting,
-  correction, quality control, and averaging inputs differ.
-- A PurpleAir sensor mounted indoors or near a local particle source may not
-  represent neighborhood outdoor air.
-- Do not replace emergency instructions or medical advice with plugin output.
-
-The included Linux test suite can be run with:
-
-```sh
-./tests/run-tests.sh
-```
-
-## 15. References
-
-- [EPA AQS AQI breakpoints](https://aqs.epa.gov/aqsweb/documents/codetables/aqi_breakpoints.html)
-- [EPA AQI Technical Assistance Document](https://www.airnow.gov/publications/air-quality-index/technical-assistance-document-for-reporting-the-daily-aqi/)
-- [EPA extended U.S.-wide PurpleAir correction](https://www.epa.gov/sites/default/files/2021-05/documents/toolsresourceswebinar_purpleairsmoke_210519b.pdf)
-- [Meteobridge template variables](https://www.meteobridge.com/wiki/index.php/Templates)
-
-## 16. License
+## 14. License
 
 MIT. See `LICENSE`.
