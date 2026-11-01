@@ -77,7 +77,6 @@ local plugin, not a single-file URL plugin.
 | `README.md` | Complete documentation | No |
 | `RELEASE-NOTES-v2.0.0.md` | Release and migration notes | No |
 | `CHANGELOG.md` | Version history | No |
-| `FORUM-POST-phpBB.txt` | Ready-to-paste forum announcement | No |
 | `LICENSE` | MIT license | No |
 | `tests/run-tests.sh` | Linux validation suite | No |
 
