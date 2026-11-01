@@ -84,7 +84,7 @@ local plugin, not a single-file URL plugin.
 ### 4.1 Reserve and test the PurpleAir address
 
 Create a DHCP reservation so the sensor address does not change. This
-installation uses `10.24.170.191`.
+installation uses `192.168.100.1`.
 
 The included address is specific to the original installation. Anyone using
 this project from GitHub must replace it with the reserved LAN address of their
@@ -93,7 +93,7 @@ own PurpleAir sensor.
 Test it from Meteobridge:
 
 ```sh
-wget -qO- http://10.24.170.191/json
+wget -qO- http://192.168.100.1/json
 ```
 
 The JSON must contain `pm2_5_atm`, `pm2_5_atm_b`, `current_humidity`, and
