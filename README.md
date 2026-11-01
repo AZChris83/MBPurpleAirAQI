@@ -123,7 +123,7 @@ chmod 644 /temp/data/scripts/meteobridge-aqi.conf
 The included configuration contains:
 
 ```sh
-PURPLEAIR_URL="http://10.24.170.191/json"
+PURPLEAIR_URL="http://192.168.100.1/json"
 PM25_SOURCE="atm"
 UPDATE_SECONDS=120
 ```
@@ -179,7 +179,7 @@ lower uptime is accepted as a sensor reboot. The default maximum is 300 seconds.
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `PURPLEAIR_URL` | `http://10.24.170.191/json` | Complete local JSON URL |
+| `PURPLEAIR_URL` | `http://192.168.100.1/json` | Complete local JSON URL |
 | `PM25_SOURCE` | `atm` | `atm` or `cf1`; A and B are averaged |
 | `MAX_SENSOR_AGE` | `300` | Accepted unchanged uptime in seconds |
 | `HTTP_TIMEOUT` | `10` | HTTP request timeout in seconds |
@@ -347,7 +347,7 @@ Run from `/temp/data/scripts`:
 `--show-source` should display:
 
 ```text
-PurpleAir URL: http://10.24.170.191/json
+PurpleAir URL: http://192.168.100.1/json
 PM2.5 source: atm (channel A/B average)
 ```
 
@@ -355,9 +355,9 @@ PM2.5 source: atm (channel A/B average)
 
 ### 10.1 Status remains 1
 
-Run `wget -qO- http://10.24.170.191/json`, then verify:
+Run `wget -qO- http://192.168.100.1/json`, then verify:
 
-1. The reservation is still `10.24.170.191`.
+1. The reservation is still `192.168.100.1`.
 2. Meteobridge can reach TCP port 80 across the VLANs.
 3. JSON contains both ATM PM2.5 fields and `uptime`.
 4. `uptime` increases between requests.
