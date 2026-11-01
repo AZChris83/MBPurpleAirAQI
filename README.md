@@ -4,7 +4,6 @@ Version 2.0.0
 
 - [Version 2.0.0 release notes](RELEASE-NOTES-v2.0.0.md)
 - [Changelog](CHANGELOG.md)
-- [Ready-to-paste phpBB announcement](FORUM-POST-phpBB.txt)
 
 ## 1. Purpose
 
